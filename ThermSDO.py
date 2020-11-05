@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # file ThermSDO.py
 
-import sys, can, time, datetime, string, struct, asyncio
+import sys, can, time, datetime, string, struct, asyncio, math
 
 # setup for SK Pang PiCAN2 interface adapter
 # https://copperhilltech.com/pican2-controller-area-network-can-interface-for-raspberry-pi/
@@ -18,13 +18,13 @@ canBus = can.interface.Bus(channel='slcan0', bustype = 'socketcan_native')
 # command line arguments
 print ('ThermSDO.py reads temperature from Maxim/Dallas DS1621')
 print ('thermometer connected by I2C to Raspberry Pi computer.')
-print ('M. Williamsen, 11/1/2020, https://github.com/springleik')
+print ('M. Williamsen, 11/4/2020, https://github.com/springleik')
 print ('Usage: python3 ThermSDO.py [arg names and values]')
 print ('  arg name | arg value')
 print ('  ---------|----------')
-print ('  -addr    | DS1621 I2C address    (default is 0x48)')
-print ('  -node    | CAN node number       (default is 43)')
-print ('  -indx    | CAN SDO index         (default is 0x6000)')
+print ('  -addr    | DS1621 I2C address  (default is 0x48)')
+print ('  -node    | CAN node number     (default is 43)')
+print ('  -indx    | CAN SDO index       (default is 0x6000)')
 
 # set defaults
 ds1621Addr = 0x48
@@ -74,26 +74,38 @@ except (IOError, OSError, ImportError) as e:
 	print ('Failed to initialize hardware: {0}'.format(e))
 	print ('   Running in simulation mode.')
 
-# function to read and report temperature
+# function to read DS1621 registers
+def getRegisters():
+	regIs = regWas = (float("NaN"), float("NaN"), float("NaN"))
+	if not i2cBus: return regIs
+
+	# read registers until they match
+	while True:
+		regIs = (i2cBus.read_word_data(ds1621Addr, readTemp),
+			i2cBus.read_byte_data(ds1621Addr, readCount),
+			i2cBus.read_byte_data(ds1621Addr, readSlope))
+		if regIs == regWas: break
+		regWas = regIs
+	return regIs
+
+# function to compute and report temperatures
 def getDataPoint():
-	if not i2cBus:
-		message = {'message':'Simulation mode enabled.'}
-		print(message)
-		return message
+	# need three registers to obtain high resolution
+	therm, count, slope = getRegisters()
+	
+	# don't return numbers in simulation mode
+	if math.isnan(therm): loRes = hiRes = therm
+	else:
+		# compute standard (1/2-deg) resolution
+		loRes  = (therm << 1) & 0x1fe
+		loRes |= (therm >> 15) & 0x01
+		if loRes > 255: loRes -= 512
+		loRes /= 2.0
 
-	# read standard (1/2-deg) resolution
-	therm = i2cBus.read_word_data(ds1621Addr, readTemp)
-	loRes  = (therm << 1) & 0x1fe
-	loRes |= (therm >> 15) & 0x01
-	if loRes > 255: loRes -= 512
-	loRes /= 2.0
-
-	# read high (1/16-deg) resolution
-	count = i2cBus.read_byte_data(ds1621Addr, readCount)
-	slope = i2cBus.read_byte_data(ds1621Addr, readSlope)
-	temp = therm & 0xff
-	if temp > 127: temp -= 256
-	hiRes = temp - 0.25 + (slope - count) / slope
+		# compute high (1/16-deg) resolution
+		temp = therm & 0xff
+		if temp > 127: temp -= 256
+		hiRes = temp - 0.25 + (slope - count) / slope
 
 	# build data point structure
 	now = datetime.datetime.now()
@@ -107,6 +119,7 @@ def getDataPoint():
 
 print ('Responding to SDO {0} at node {1}.'.format(hex(theIndx), theNode))
 
+# ----------------------------------------------------------
 # notifier callback handler
 def callback(msg):
 	hiByte = (msg.arbitration_id >> 8) & 0xff
@@ -165,5 +178,3 @@ try:
 	asyncio.run(main())
 except (KeyboardInterrupt):
 	print('  User exit request.')
-
-
